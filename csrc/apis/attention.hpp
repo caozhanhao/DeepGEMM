@@ -180,7 +180,10 @@ static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::opt
 
     // Allocate output
     constexpr int block_qh = 128;
-    const int block_kv = (arch_major == 12) ? 128 : 256;  // SM120 dense MQA uses block_kv=128
+    const bool optimize_bf16_indexer = arch_major == 10 and not is_fp4 and
+        num_heads == 32 and head_dim == 128 and max_seqlen_k > 0 and max_seqlen_k <= 262144 and
+        weights.scalar_type() == torch::kBFloat16 and logits_dtype == torch::kBFloat16;
+    const int block_kv = optimize_bf16_indexer ? 384 : ((arch_major == 12) ? 128 : 256);
     const int block_q = block_qh / num_heads;
     DG_HOST_ASSERT(block_qh % num_heads == 0);
 
@@ -462,11 +465,12 @@ static torch::Tensor fp8_mqa_logits_bf16(
         const torch::Tensor& cu_seq_len_k_start,
         const torch::Tensor& cu_seq_len_k_end,
         const bool& clean_logits,
-        const int& max_seqlen_k) {
+        const int& max_seqlen_k,
+        const std::optional<torch::Tensor>& q_mask = std::nullopt) {
     return fp8_fp4_mqa_logits(
         std::make_tuple(q, std::nullopt), kv, weights,
         cu_seq_len_k_start, cu_seq_len_k_end,
-        clean_logits, max_seqlen_k, torch::kBFloat16);
+        clean_logits, max_seqlen_k, torch::kBFloat16, q_mask);
 }
 
 static torch::Tensor fp8_mqa_backward_logits(
@@ -705,6 +709,12 @@ static void register_apis(pybind11::module_& m) {
           py::arg("indices") = std::nullopt);
     // Legacy API
     m.def("fp8_mqa_logits", &fp8_mqa_logits,
+          py::arg("q"), py::arg("kv"), py::arg("weights"),
+          py::arg("cu_seq_len_k_start"), py::arg("cu_seq_len_k_end"),
+          py::arg("clean_logits") = true,
+          py::arg("max_seqlen_k") = 0,
+          py::arg("q_mask") = std::nullopt);
+    m.def("fp8_mqa_logits_bf16", &fp8_mqa_logits_bf16,
           py::arg("q"), py::arg("kv"), py::arg("weights"),
           py::arg("cu_seq_len_k_start"), py::arg("cu_seq_len_k_end"),
           py::arg("clean_logits") = true,

@@ -176,10 +176,14 @@ static void sm100_mqa_logits(const bool& is_fp4,
                              const int& block_q, const int& split_kv,
                              const std::optional<torch::Tensor>& q_mask = std::nullopt) {
     constexpr int num_specialized_threads = 128;
-    const int num_math_threads = 2 * 128;
+    const bool optimize_bf16_indexer = not is_fp4 and max_seqlen_k > 0 and
+        num_heads == 32 and head_dim == 128 and split_kv == 384 and
+        weights.scalar_type() == torch::kBFloat16 and logits_dtype == torch::kBFloat16;
+    const int num_math_threads = optimize_bf16_indexer ? 3 * 128 : 2 * 128;
     const int num_q_stages = 3;
-    // Use the deepest KV pipeline that fits with headroom: FP4 10 stages, FP8 5
-    const int num_kv_stages = is_fp4 ? 10 : 5;
+    // The BF16 specialization uses a 384-token tile and three KV stages.
+    const int num_kv_stages = optimize_bf16_indexer ? 3 : (is_fp4 ? 10 : 5);
+    const int tma_kv_tokens = optimize_bf16_indexer ? 128 : split_kv;
 
     const bool is_compressed_logits = (max_seqlen_k > 0);
 
@@ -206,10 +210,10 @@ static void sm100_mqa_logits(const bool& is_fp4,
         tensor_map_q = make_tma_2d_desc(q, head_dim, num_q_tokens * num_heads,
                                         head_dim, block_q * num_heads, head_dim, head_dim);
         tensor_map_kv = make_tma_2d_desc(kv, head_dim, num_kv_tokens,
-                                         head_dim, split_kv, head_dim, head_dim);
+                                         head_dim, tma_kv_tokens, head_dim, head_dim);
         tensor_map_sf_kv = make_tma_2d_desc(sf_kv,
                                             get_tma_aligned_size(num_kv_tokens, static_cast<int>(sf_kv.element_size())),
-                                            1, split_kv, 1, 0, 0);
+                                            1, tma_kv_tokens, 1, 0, 0);
         tensor_map_sf_q = tensor_map_sf_kv;  // unused by FP8
     }
     const auto tensor_map_weights = make_tma_2d_desc(weights, num_heads, num_q_tokens,
@@ -252,6 +256,8 @@ static void sm100_mqa_logits(const bool& is_fp4,
             }
         });
     }
+    if (optimize_bf16_indexer)
+        smem_size = sizeof(layout::MQALogitsSharedStorage<false, 32, 128, 4, 384, 3, 3, 3, __nv_bfloat16>);
     DG_HOST_ASSERT(smem_size <= SM100ArchSpec::smem_capacity);
 
     const SM100MQALogitsRuntime::Args args = {

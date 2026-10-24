@@ -445,9 +445,14 @@ def mega_moe_pre_dispatch_sm90(x: torch.Tensor,
 
 
 # Long-context TopK wrappers.
-def fp8_mqa_logits_bf16(q, kv, weights, ks, ke, clean_logits=False, max_seqlen_k=0):
+def fp8_mqa_logits_bf16(q, kv, weights, ks, ke, clean_logits=False, max_seqlen_k=0, q_mask=None):
+    """FP8 Q/K scoring with BF16 logits; BF16 weights select BF16 head reduction.
+
+    SM100-family H32/D128 compressed prefill up to 256K uses the optimized
+    pipeline. Masked rows are left unwritten; the Top-K reader must honor q_mask.
+    """
     (kv_data, kv_sf) = _parse_tensor_or_tuple(kv)
-    return _C.fp8_mqa_logits_bf16(q, kv_data, kv_sf, weights, ks, ke, clean_logits, max_seqlen_k)
+    return _C.fp8_mqa_logits_bf16(q, kv_data, kv_sf, weights, ks, ke, clean_logits, max_seqlen_k, q_mask)
 
 def build_mqa_backward_metadata(
     ks, ke, request_q_lengths, backward_len=65536, block_q=4

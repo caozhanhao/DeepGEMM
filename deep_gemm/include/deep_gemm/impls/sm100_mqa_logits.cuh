@@ -59,7 +59,8 @@ template <bool kIsFP4, uint32_t kNumHeads, uint32_t kHeadDim,
           uint32_t kNumSpecializedThreads, uint32_t kNumMathThreads,
           typename logits_dtype_t, typename reduce_dtype_t, typename MakeScheduler,
           uint32_t kNumMathWarpGroups = kNumMathThreads / 128,
-          bool kEnableFilter = false, bool kBlockSharedOutput = false, bool kHasQMask = false>
+          bool kEnableFilter = false, bool kBlockSharedOutput = false, bool kHasQMask = false,
+          bool kOptimizeBF16Indexer = false>
 CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                                                logits_dtype_t* logits,
                                                const cute::TmaDescriptor& tensor_map_q,
@@ -72,6 +73,10 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
     DG_STATIC_ASSERT(not kEnableFilter or (not kIsFP4 and kNumHeads == 32 and
                      kNumMathThreads == 256 and cute::is_same_v<reduce_dtype_t, float>),
                      "Candidate filtering requires FP8, FP32 weights and eight math warps");
+    DG_STATIC_ASSERT(not kOptimizeBF16Indexer or (not kIsFP4 and kIsCompressedLogits and
+                     kNumHeads == 32 and kHeadDim == 128 and BLOCK_Q == 4 and SPLIT_KV == 384 and
+                     kNumMathWarpGroups == 3 and cute::is_same_v<reduce_dtype_t, __nv_bfloat16> and
+                     cute::is_same_v<logits_dtype_t, cutlass::bfloat16_t>), "Invalid BF16 indexer specialization");
     const auto sm_idx = blockIdx.x;
     const auto warp_idx = cutlass::canonical_warp_idx_sync();
     const auto warpgroup_idx = warp_idx / 4;
@@ -144,9 +149,15 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
     RingPipeline<kNumQStages> q_pipeline;
     RingPipeline<kNumKVStages> kv_pipeline;
     RingPipeline<kNumTmemStages> tmem_pipeline;
+    uint32_t mma_tmem_phase = 0;
 
     constexpr uint32_t kNumSpecializedRegisters = 56;
-    constexpr uint32_t kNumMathRegisters = 224;
+    // Three math groups share the register budget with the producer group.
+    constexpr uint32_t kNumGroups = kNumMathWarpGroups + 1;
+    constexpr uint32_t kEntryRegisters = (512 / kNumGroups / 8) * 8;
+    constexpr uint32_t kNumMathRegisters = kOptimizeBF16Indexer
+        ? ((kEntryRegisters * kNumGroups - kNumSpecializedRegisters) / kNumMathWarpGroups / 8) * 8
+        : 224;
 
     cudaGridDependencySynchronize();
 
@@ -225,11 +236,16 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                     smem.empty_kv_barriers[kv_stage_idx].wait(kv_phase ^ 1);
 
                     const uint32_t kv_tma_offset = scheduler.get_kv_tma_offset(kv_base, kv_split_idx);
-                    tma::copy<kNumQKBytesPerToken, SPLIT_KV, 0>(
-                        &tensor_map_kv, &smem.full_kv_barriers[kv_stage_idx],
-                        smem.smem_kv[kv_stage_idx], 0, kv_tma_offset);
-                    tma::copy<SPLIT_KV, 1, 0>(&tensor_map_sf_kv, &smem.full_kv_barriers[kv_stage_idx],
-                                              smem.smem_sf_kv[kv_stage_idx], kv_tma_offset, 0);
+                    // A 384-token tile is transferred as three 128-token TMA boxes.
+                    constexpr uint32_t kTokensPerTMA = kOptimizeBF16Indexer ? 128 : SPLIT_KV;
+                    #pragma unroll
+                    for (uint32_t offset = 0; offset < SPLIT_KV; offset += kTokensPerTMA) {
+                        tma::copy<kNumQKBytesPerToken, kTokensPerTMA, 0>(
+                            &tensor_map_kv, &smem.full_kv_barriers[kv_stage_idx],
+                            smem.smem_kv[kv_stage_idx] + offset * kNumQKBytesPerToken, 0, kv_tma_offset + offset);
+                        tma::copy<kTokensPerTMA, 1, 0>(&tensor_map_sf_kv, &smem.full_kv_barriers[kv_stage_idx],
+                            smem.smem_sf_kv[kv_stage_idx] + offset, kv_tma_offset + offset, 0);
+                    }
                     smem.full_kv_barriers[kv_stage_idx].arrive_and_expect_tx(SMEM_KV_SIZE_PER_STAGE + SMEM_SF_KV_SIZE_PER_STAGE);
                 }
                 __syncwarp();
@@ -299,7 +315,16 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                     }
                     #pragma unroll
                     for (uint32_t i = 0; i < kNumMathWarpGroups; ++ i) {
-                        CUTE_TIE_DECL(tmem_pipeline.advance(), tmem_stage_idx, tmem_phase);
+                        uint32_t tmem_stage_idx, tmem_phase;
+                        if constexpr (kOptimizeBF16Indexer) {
+                            // One TMEM buffer per math warpgroup; toggle after all groups.
+                            tmem_stage_idx = i;
+                            tmem_phase = mma_tmem_phase;
+                        } else {
+                            CUTE_TIE_DECL(tmem_pipeline.advance(), stage, phase);
+                            tmem_stage_idx = stage;
+                            tmem_phase = phase;
+                        }
                         uint32_t tmem_addr = tmem_stage_idx * UMMA_N;
 
                         smem.empty_tmem_barriers[tmem_stage_idx].wait(tmem_phase ^ 1);
@@ -344,6 +369,8 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                                      ::"r"(cute::cast_smem_ptr_to_uint(&smem.full_tmem_barriers[tmem_stage_idx])));
                     }
                 }
+                if constexpr (kOptimizeBF16Indexer)
+                    mma_tmem_phase ^= 1;
                 __syncwarp();
                 if constexpr (kIsFP4)
                     cutlass::arch::umma_arrive(reinterpret_cast<uint64_t*>(&smem.empty_kv_barriers[kv_stage_idx]));
@@ -367,7 +394,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
         using weights_reg_dtype_t = cute::conditional_t<kIsReduceBF16, nv_bfloat162, float>;
         constexpr uint32_t kNumWeightsRegPerToken = kIsReduceBF16 ? (kNumHeads / 2) : kNumHeads;
         weights_reg_dtype_t weights[BLOCK_Q][kNumWeightsRegPerToken];
-        float accum[kNumHeads];
+        float accum[kOptimizeBF16Indexer ? 16 : kNumHeads];
         MQACandidateWriter<BLOCK_Q, kEnableFilter> candidate_writer(candidate_output, warp_idx, lane_idx);
 
         auto tmem_load_no_fence = [](auto num_elems_t, const uint32_t& addr, float* load_dst) {
@@ -392,6 +419,14 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
 
             const auto process_q_block = [&](auto num_valid_tokens_t) {
                 constexpr uint32_t kNumValidTokens = decltype(num_valid_tokens_t)::value;
+                uint64_t output_bases[BLOCK_Q];
+                if constexpr (kOptimizeBF16Indexer) {
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kNumValidTokens; ++ i)
+                        output_bases[i] = reinterpret_cast<uint64_t>(logits) +
+                            (scheduler.get_logits_row(q_block_idx, i) * static_cast<uint64_t>(logits_stride) -
+                             seq_k_start[i]) * sizeof(logits_dtype_t);
+                }
                 if constexpr (kEnableFilter)
                     candidate_writer.template begin<kNumValidTokens>(scheduler, q_block_idx);
 
@@ -413,6 +448,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                     }
                 }
 
+                #pragma unroll (kOptimizeBF16Indexer ? 2 : 1)
                 for (uint32_t kv_split_idx = 0; kv_split_idx < num_kv_splits; ++ kv_split_idx) {
                     auto kv_offset = scheduler.get_logits_col(kv_base, kv_split_idx, math_thread_idx);
 
@@ -437,67 +473,101 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
 
                     #pragma unroll
                     for (uint32_t i = 0; i < kNumValidTokens; ++ i) {
-                        uint32_t tmem_addr = tmem_stage_idx * UMMA_N + i * kNumHeads;
-                        if constexpr (kNumHeads == 8) {
-                            tmem_load_no_fence(cute::Int<kNumHeads>{}, tmem_addr, accum);
-                            cutlass::arch::fence_view_async_tmem_load();
-                        } else if constexpr (kNumHeads == 16) {
-                            tmem_load_no_fence(cute::Int<kNumHeads / 2>{}, tmem_addr, accum);
-                            tmem_load_no_fence(cute::Int<kNumHeads / 2>{}, tmem_addr + kNumHeads / 2, accum + kNumHeads / 2);
-                            cutlass::arch::fence_view_async_tmem_load();
-                        } else {
-                            tmem_load_no_fence(cute::Int<kNumHeads / 2>{}, tmem_addr, accum);
-                            cutlass::arch::fence_view_async_tmem_load();
-                            tmem_load_no_fence(cute::Int<kNumHeads / 2>{}, tmem_addr + kNumHeads / 2, accum + kNumHeads / 2);
-                            cutlass::arch::fence_view_async_tmem_load();
-                        }
-
-                        if (i == kNumValidTokens - 1) {
-                            ptx::tcgen05_before_thread_sync();
-                            smem.empty_tmem_barriers[tmem_stage_idx].arrive();
-                        }
-
-                        // Release TMEM above even when the last row is masked.
-                        if constexpr (kHasQMask) {
-                            if (not scheduler.is_row_active(q_block_idx, i))
-                                continue;
-                        }
                         reduce_dtype_t reduced;
-                        if constexpr (kIsReduceBF16) {
+                        if constexpr (kOptimizeBF16Indexer) {
                             auto sum_0 = __floats2bfloat162_rn(0.0f, 0.0f);
                             auto sum_1 = __floats2bfloat162_rn(0.0f, 0.0f);
-                            const auto transform = [&](const uint32_t& j, const nv_bfloat162& sum) {
-                                const auto a = ptx::cvt_relu_bf16x2_f32(make_float2(accum[j], accum[j + 1]));
-                                const auto b = weights[i][j / 2];
-                                return __hfma2(a, b, sum);
-                            };
-
+                            bool row_active = true;
+                            if constexpr (kHasQMask)
+                                row_active = scheduler.is_row_active(q_block_idx, i);
                             #pragma unroll
-                            for (uint32_t j = 0; j < kNumHeads; j += 4) {
-                                sum_0 = transform(j, sum_0);
-                                sum_1 = transform(j + 2, sum_1);
+                            for (uint32_t head_base = 0; head_base < 32; head_base += 16) {
+                                const uint32_t addr = tmem_stage_idx * UMMA_N + i * kNumHeads + head_base;
+                                tmem_load_no_fence(cute::Int<16>{}, addr, accum);
+                                cutlass::arch::fence_view_async_tmem_load();
+                                if (head_base == 16 and i == kNumValidTokens - 1) {
+                                    ptx::tcgen05_before_thread_sync();
+                                    smem.empty_tmem_barriers[tmem_stage_idx].arrive();
+                                }
+                                if (row_active) {
+                                    const auto transform = [&](const uint32_t& j, const nv_bfloat162& sum) {
+                                        const auto a = ptx::cvt_relu_bf16x2_f32(make_float2(accum[j], accum[j + 1]));
+                                        return __hfma2(a, weights[i][(head_base + j) / 2], sum);
+                                    };
+                                    #pragma unroll
+                                    for (uint32_t j = 0; j < 16; j += 4) {
+                                        sum_0 = transform(j, sum_0);
+                                        sum_1 = transform(j + 2, sum_1);
+                                    }
+                                }
                             }
-
-                            auto sum = __hadd2_rn(sum_0, sum_1);
+                            // Every row, including masked rows, must release the last TMEM buffer.
+                            if (not row_active)
+                                continue;
+                            const auto sum = __hadd2_rn(sum_0, sum_1);
                             reduced = __hadd_rn(sum.x, sum.y);
                         } else {
-                            auto sum_0 = make_float2(0, 0);
-                            auto sum_1 = make_float2(0, 0);
-                            const auto transform = [&](const uint32_t& j, const float2& sum) {
-                                auto a_0 = make_float2(accum[j], accum[j + 1]);
-                                auto a_1 = make_float2(fabsf(accum[j]), fabsf(accum[j + 1]));
-                                auto b = make_float2(weights[i][j], weights[i][j + 1]);
-                                return __ffma2_rn(__fadd2_rn(a_0, a_1), b, sum);
-                            };
-
-                            #pragma unroll
-                            for (uint32_t j = 0; j < kNumHeads; j += 4) {
-                                sum_0 = transform(j, sum_0);
-                                sum_1 = transform(j + 2, sum_1);
+                            uint32_t tmem_addr = tmem_stage_idx * UMMA_N + i * kNumHeads;
+                            if constexpr (kNumHeads == 8) {
+                                tmem_load_no_fence(cute::Int<kNumHeads>{}, tmem_addr, accum);
+                                cutlass::arch::fence_view_async_tmem_load();
+                            } else if constexpr (kNumHeads == 16) {
+                                tmem_load_no_fence(cute::Int<kNumHeads / 2>{}, tmem_addr, accum);
+                                tmem_load_no_fence(cute::Int<kNumHeads / 2>{}, tmem_addr + kNumHeads / 2, accum + kNumHeads / 2);
+                                cutlass::arch::fence_view_async_tmem_load();
+                            } else {
+                                tmem_load_no_fence(cute::Int<kNumHeads / 2>{}, tmem_addr, accum);
+                                cutlass::arch::fence_view_async_tmem_load();
+                                tmem_load_no_fence(cute::Int<kNumHeads / 2>{}, tmem_addr + kNumHeads / 2, accum + kNumHeads / 2);
+                                cutlass::arch::fence_view_async_tmem_load();
                             }
 
-                            auto sum = __fadd2_rn(sum_0, sum_1);
-                            reduced = (sum.x + sum.y) / 2;
+                            if (i == kNumValidTokens - 1) {
+                                ptx::tcgen05_before_thread_sync();
+                                smem.empty_tmem_barriers[tmem_stage_idx].arrive();
+                            }
+
+                            // Release TMEM above even when the last row is masked.
+                            if constexpr (kHasQMask) {
+                                if (not scheduler.is_row_active(q_block_idx, i))
+                                    continue;
+                            }
+                            if constexpr (kIsReduceBF16) {
+                                auto sum_0 = __floats2bfloat162_rn(0.0f, 0.0f);
+                                auto sum_1 = __floats2bfloat162_rn(0.0f, 0.0f);
+                                const auto transform = [&](const uint32_t& j, const nv_bfloat162& sum) {
+                                    const auto a = ptx::cvt_relu_bf16x2_f32(make_float2(accum[j], accum[j + 1]));
+                                    const auto b = weights[i][j / 2];
+                                    return __hfma2(a, b, sum);
+                                };
+
+                                #pragma unroll
+                                for (uint32_t j = 0; j < kNumHeads; j += 4) {
+                                    sum_0 = transform(j, sum_0);
+                                    sum_1 = transform(j + 2, sum_1);
+                                }
+
+                                auto sum = __hadd2_rn(sum_0, sum_1);
+                                reduced = __hadd_rn(sum.x, sum.y);
+                            } else {
+                                auto sum_0 = make_float2(0, 0);
+                                auto sum_1 = make_float2(0, 0);
+                                const auto transform = [&](const uint32_t& j, const float2& sum) {
+                                    auto a_0 = make_float2(accum[j], accum[j + 1]);
+                                    auto a_1 = make_float2(fabsf(accum[j]), fabsf(accum[j + 1]));
+                                    auto b = make_float2(weights[i][j], weights[i][j + 1]);
+                                    return __ffma2_rn(__fadd2_rn(a_0, a_1), b, sum);
+                                };
+
+                                #pragma unroll
+                                for (uint32_t j = 0; j < kNumHeads; j += 4) {
+                                    sum_0 = transform(j, sum_0);
+                                    sum_1 = transform(j + 2, sum_1);
+                                }
+
+                                auto sum = __fadd2_rn(sum_0, sum_1);
+                                reduced = (sum.x + sum.y) / 2;
+                            }
                         }
                         auto result = static_cast<logits_dtype_t>(kIsFP4 ? reduced : reduced * scale_kv);
                         if constexpr (kEnableFilter) {
@@ -515,8 +585,14 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                             } else if constexpr (kIsCompressedLogits) {
                                 const uint32_t rel_kv = kv_offset - seq_k_start[i];
                                 const uint32_t len = seq_k_end[i] - seq_k_start[i];
-                                if (rel_kv < len)
-                                    logits[q_offset + rel_kv] = result;
+                                if (rel_kv < len) {
+                                    if constexpr (kOptimizeBF16Indexer) {
+                                        auto* ptr = reinterpret_cast<logits_dtype_t*>(
+                                            output_bases[i] + static_cast<uint64_t>(kv_offset) * sizeof(logits_dtype_t));
+                                        *ptr = result;
+                                    } else
+                                        logits[q_offset + rel_kv] = result;
+                                }
                             } else {
                                 logits[q_offset + kv_offset] = result;
                             }
@@ -571,7 +647,11 @@ void sm100_mqa_logits(const uint32_t num_q_tokens, const uint32_t num_kv_tokens,
     sm100_mqa_logits_core_impl<kIsFP4, kNumHeads, kHeadDim, kIsCompressedLogits, BLOCK_Q, SPLIT_KV,
                                kNumQStages, kNumKVStages, kNumSMs,
                                kNumSpecializedThreads, kNumMathThreads, logits_dtype_t,
-                               reduce_dtype_t, decltype(make_scheduler), kNumMathWarpGroups, false, false, kHasQMask>(
+                               reduce_dtype_t, decltype(make_scheduler), kNumMathWarpGroups, false, false, kHasQMask,
+                               not kIsFP4 and kIsCompressedLogits and kNumHeads == 32 and kHeadDim == 128 and
+                               BLOCK_Q == 4 and SPLIT_KV == 384 and
+                               cute::is_same_v<reduce_dtype_t, __nv_bfloat16> and
+                               cute::is_same_v<logits_dtype_t, cutlass::bfloat16_t>>(
         logits_stride, logits,
         tensor_map_q, tensor_map_sf_q, tensor_map_kv, tensor_map_sf_kv, tensor_map_weights,
         make_scheduler);

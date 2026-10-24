@@ -576,7 +576,8 @@ Tensor dg_fp8_mqa_logits_bf16(
         TensorView q, TensorView kv_data, TensorView kv_sf,
         TensorView weights, TensorView cu_seq_len_k_start,
         TensorView cu_seq_len_k_end, bool clean_logits,
-        int64_t max_seqlen_k) {
+        int64_t max_seqlen_k, Optional<TensorView> q_mask) {
+    auto mask = q_mask.has_value() ? std::make_optional(convert_to_torch_tensor(q_mask.value())) : std::nullopt;
     auto result = attention::fp8_mqa_logits_bf16(
         convert_to_torch_tensor(q),
         std::make_pair(convert_to_torch_tensor(kv_data),
@@ -584,7 +585,7 @@ Tensor dg_fp8_mqa_logits_bf16(
         convert_to_torch_tensor(weights),
         convert_to_torch_tensor(cu_seq_len_k_start),
         convert_to_torch_tensor(cu_seq_len_k_end),
-        clean_logits, static_cast<int>(max_seqlen_k));
+        clean_logits, static_cast<int>(max_seqlen_k), mask);
     return Tensor::FromDLPack(at::toDLPack(result));
 }
 
