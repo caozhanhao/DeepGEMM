@@ -92,10 +92,59 @@ Source/PC counters locate hot instructions and waits; they do not supply a full
 G1/G2/dispatch/combine software timeline. Sparse internal timestamp probes are
 a follow-up selected from the GPU evidence; this version does not add them.
 
+## Locality report from a captured call
+
+```bash
+python tools/analyze_mega_moe_locality.py \
+  /scratch/megamoe/capture-01/forward-00000042-layer-041 \
+  --output /scratch/megamoe/locality-01.json
+```
+
+This CPU-only reader loads trusted input tensors with `weights_only=True` and
+does not import the native extension or initialize CUDA. It verifies all rank
+manifests and consumed input hashes; large weight/reference files are checked
+for presence/size but are not rehashed or loaded. Existing output files are
+never overwritten.
+
+It writes JSON, a readable Markdown report, an edge CSV, and a `.tokens.csv`
+file with one row per `(source_rank, native_row)`. The report includes:
+
+- `A[source, physical_expert]`: assignment counts, retaining source identity.
+- `C[source, destination]`: assignments to each destination EP rank.
+- `U[source, destination]`: distinct source rows reaching that destination,
+  counting a row only once even when it selects multiple experts on that rank.
+- Per-token destination/remote fan-out, its distribution, local/remote
+  assignment fractions, destination load, and unused buffer capacity.
+- Separate `all`, `valid`, `padding`, and `unknown` row scopes. Each scope has
+  its own matrices and histograms; unknown rows never become valid implicitly.
+
+Physical slots are contiguous and equally divided across EP ranks under the
+native MegaMoE ABI. This is independent of logical expert placement. C/U and
+their ratio describe routing and potential reuse, **not measured link bytes,
+deduplication, cache hit rate, bandwidth, or kernel speedup**. Local means the
+same EP rank/GPU, not merely the same host. The token CSV uses native row
+indices; it is not a complete request/token attribution map.
+
+New captures may provide `row_validity = {"status": "known", "valid_mask":
+[true, false, ...], ...}` from the producer's verified token layout. The mask
+has exactly native M booleans. Missing or explicitly unknown annotations keep
+all affected rows unknown. A `-1` expert ID masks one route slot; neither it,
+zero activation/weight values, nor legacy `source_valid_rows` identifies
+semantic padding. A padding row can still have nonmasked routes and consume
+work, while a valid row can have all routes masked. Unused capacity beyond
+native M is excluded from these counts.
+
+Source histograms are recomputed from route tensors. If every rank manifest
+also has `expert_recv_counts` from the captured native call, their concatenated
+counts must equal the sum of source histograms; partial or mismatching counters
+are rejected. Legacy captures without counters report that check unavailable.
+Placement and routing-override metadata, when present, must agree across ranks.
+
 ## CPU checks
 
 ```bash
 python tests/test_mega_moe_diagnostics_cpu.py -v
+python tests/test_mega_moe_locality_cpu.py -v
 ```
 
 The manifest, consensus, route-count, statistics and NCU-command tests use the
